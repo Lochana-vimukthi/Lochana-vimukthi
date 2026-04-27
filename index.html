@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEXIS — Stock Manager</title>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.10.0/firebase-app.js";
+  import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.10.0/firebase-analytics.js";
+  import {
+    getDatabase, ref, set, push, get, update, remove, onValue, increment
+  } from "https://www.gstatic.com/firebasejs/12.10.0/firebase-database.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyByP4GhQYsuKTxS-idIYJgn5WjN2B7wRwA",
+    authDomain: "nexis-stock-1daf7.firebaseapp.com",
+    databaseURL: "https://nexis-stock-1daf7-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "nexis-stock-1daf7",
+    storageBucket: "nexis-stock-1daf7.firebasestorage.app",
+    messagingSenderId: "446519970163",
+    appId: "1:446519970163:web:ec0b36c5294394db905d06",
+    measurementId: "G-80M6LKJ8FG"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const analytics = getAnalytics(app);
+  const db = getDatabase(app);
+
+  // ── ADD single item ──
+  window.addItemToFirebase = function(item) {
+    const newItemRef = push(ref(db, "items"));
+    item.firebaseKey = newItemRef.key;
+    set(newItemRef, {
+      id: item.id,
+      name: item.name,
+      color: item.color,
+      type: item.type,
+      sizes: item.sizes,
+      time: Date.now()
+    }).catch(err => console.error("Firebase write error:", err));
+  };
+
+  // ── DELETE single item ──
+  window.deleteItemFromFirebase = function(firebaseKey) {
+    if (!firebaseKey) return;
+    remove(ref(db, `items/${firebaseKey}`))
+      .catch(err => console.error("Firebase delete error:", err));
+  };
+
+  // ── UPDATE sizes on single item ──
+  window.updateItemInFirebase = function(firebaseKey, sizesObj) {
+    if (!firebaseKey) return;
+    update(ref(db, `items/${firebaseKey}`), { sizes: sizesObj })
+      .catch(err => console.error("Firebase update error:", err));
+  };
+
+  // ── PUSH a single sale record (never overwrites collection) ──
+  window.pushSaleToFirebase = function(saleRecord) {
+    push(ref(db, "sales"), saleRecord)
+      .catch(err => console.error("Firebase sale push error:", err));
+  };
+
+  // ── INCREMENT stock summary counters atomically ──
+  window.incrementSummary = function(totalDelta, oversizeDelta, regularDelta) {
+    const updates = {};
+    if (totalDelta)    updates["stockSummary/total"]    = increment(totalDelta);
+    if (oversizeDelta) updates["stockSummary/oversize"] = increment(oversizeDelta);
+    if (regularDelta)  updates["stockSummary/regular"]  = increment(regularDelta);
+    if (Object.keys(updates).length) {
+      update(ref(db), updates)
+        .catch(err => console.error("Firebase summary update error:", err));
+    }
+  };
+
+  // ── CLEAR all data (full reset — intentional) ──
+  window.clearAllFirebaseData = function() {
+    const updates = { items: null, sales: null, stockSummary: null };
+    update(ref(db), updates)
+      .catch(err => console.error("Firebase clear error:", err));
+  };
+
+  // ── CLEAR sales log only ──
+  window.clearSalesFirebase = function() {
+    remove(ref(db, "sales"))
+      .catch(err => console.error("Firebase sales clear error:", err));
+  };
+
+  // ════════════════════════════
+  // REAL-TIME LISTENERS
+  // Keeps local state in sync with DB at all times.
+  // Any change made by another tab/user is reflected immediately.
+  // ════════════════════════════
+
+  // Items listener
+  onValue(ref(db, "items"), snapshot => {
+    const data = snapshot.val();
+    window._rows = data
+      ? Object.entries(data).map(([key, val]) => ({ ...val, firebaseKey: key }))
+      : [];
+    window.rows = window._rows;
+    renderTable();
+    // Refresh open selects in popups if visible
+    if (document.getElementById("addStockPopup").classList.contains("active")) {
+      fillRowSelect("as_row"); syncSizeSelect("as_row", "as_size");
+    }
+    if (document.getElementById("soldPopup").classList.contains("active")) {
+      fillRowSelect("sold_row"); syncSizeSelect("sold_row", "sold_size");
+    }
+  });
+
+  // Sales listener
+  onValue(ref(db, "sales"), snapshot => {
+    const data = snapshot.val();
+    window.salesLog = data ? Object.values(data) : [];
+    updateChart();
+  });
+
+  // Stock summary listener
+  onValue(ref(db, "stockSummary"), snapshot => {
+    const data = snapshot.val() || { total: 0, oversize: 0, regular: 0 };
+    window.st = data;
+    // Re-render stats with latest summary (stock totals come from renderTable)
+    const totalStock = (window.rows || []).reduce((acc, row) => {
+      return acc + Object.values(row.sizes || {}).reduce((a, b) => a + b, 0);
+    }, 0);
+    const lowRows = (window.rows || []).filter(row =>
+      Object.values(row.sizes || {}).some(q => q > 0 && q <= 2)
+    ).length;
+    updateStats(totalStock, lowRows, (window.rows || []).length);
+  });
+
+  window._dbReady = true;
+</script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root {
+  --bg: #0a0a0a;
+  --surface: #111111;
+  --surface2: #1a1a1a;
+  --surface3: #242424;
+  --border: #2a2a2a;
+  --accent: #e8ff47;
+  --text: #f0f0f0;
+  --text-muted: #666;
+  --text-dim: #999;
+  --danger: #ff3b3b;
+  --success: #39d98a;
+  --mono: 'Space Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; overflow-x: hidden; }
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+body::before {
+  content: ''; position: fixed; inset: 0;
+  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,255,255,0.012) 2px, rgba(255,255,255,0.012) 4px);
+  pointer-events: none; z-index: 9999;
+}
+
+/* HAMBURGER */
+.hamburger {
+  position: fixed; top: 20px; left: 20px;
+  width: 44px; height: 44px; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: 8px;
+  display: flex; flex-direction: column; justify-content: center;
+  align-items: center; gap: 5px; cursor: pointer; z-index: 1001; transition: all 0.2s;
+}
+.hamburger span { display: block; width: 18px; height: 1.5px; background: var(--text); border-radius: 2px; transition: all 0.3s; }
+.hamburger:hover { border-color: var(--accent); }
+.hamburger.active span:nth-child(1) { transform: translateY(6.5px) rotate(45deg); }
+.hamburger.active span:nth-child(2) { opacity: 0; }
+.hamburger.active span:nth-child(3) { transform: translateY(-6.5px) rotate(-45deg); }
+
+/* SIDE MENU */
+.side-menu {
+  position: fixed; top: 0; left: 0; width: 280px; height: 100%;
+  background: var(--surface); border-right: 1px solid var(--border);
+  padding: 80px 22px 24px;
+  transform: translateX(-100%);
+  transition: transform 0.35s cubic-bezier(0.16,1,0.3,1);
+  z-index: 1000; overflow-y: auto;
+}
+.side-menu.open { transform: translateX(0); }
+.side-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 999; opacity: 0; pointer-events: none; transition: opacity 0.3s; }
+.side-overlay.show { opacity: 1; pointer-events: all; }
+.side-menu h2 { font-family: var(--mono); font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 24px; }
+.side-btn { width: 100%; padding: 10px; border: none; border-radius: 6px; font-family: var(--mono); font-size: 11px; letter-spacing: 1px; cursor: pointer; transition: all 0.2s; margin-bottom: 8px; }
+.side-btn-danger { background: var(--surface3); color: var(--danger); border: 1px solid var(--danger); }
+.side-btn-danger:hover { background: var(--danger); color: #fff; }
+.side-btn-warn { background: var(--surface3); color: #f0a500; border: 1px solid #f0a500; }
+.side-btn-warn:hover { background: #f0a500; color: #000; }
+
+/* MAIN */
+.main { padding: 0 28px 60px 28px; max-width: 1400px; margin: 0 auto; }
+
+/* HEADER */
+header { display: flex; justify-content: space-between; align-items: center; padding: 28px 0 36px; border-bottom: 1px solid var(--border); margin-bottom: 36px; flex-wrap: wrap; gap: 16px; }
+.brand h1 { font-family: var(--mono); font-size: 28px; letter-spacing: 6px; font-weight: 700; }
+.brand h1 span { color: var(--accent); }
+.brand p { font-size: 11px; color: var(--text-muted); letter-spacing: 3px; text-transform: uppercase; font-family: var(--mono); margin-top: 4px; }
+.header-actions { display: flex; gap: 10px; }
+.btn { padding: 11px 20px; border-radius: 6px; border: none; font-family: var(--mono); font-size: 12px; letter-spacing: 1px; cursor: pointer; transition: all 0.2s; font-weight: 700; }
+.btn-primary { background: var(--accent); color: #000; }
+.btn-primary:hover { background: #d4eb3a; transform: translateY(-1px); box-shadow: 0 6px 20px rgba(232,255,71,0.2); }
+.btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { border-color: var(--text-dim); transform: translateY(-1px); }
+.btn:active { transform: scale(0.97) !important; }
+
+/* STATS */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 14px; margin-bottom: 36px; }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; transition: all 0.25s; position: relative; overflow: hidden; }
+.stat-card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:var(--accent); opacity:0; transition:opacity 0.25s; }
+.stat-card:hover { transform: translateY(-2px); }
+.stat-card:hover::before { opacity: 1; }
+.stat-label { font-size: 10px; letter-spacing: 2.5px; text-transform: uppercase; color: var(--text-muted); font-family: var(--mono); margin-bottom: 8px; }
+.stat-value { font-family: var(--mono); font-size: 30px; font-weight: 700; line-height: 1; }
+.stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+/* ALERT */
+.alert-bar { background: rgba(255,59,59,0.08); border:1px solid rgba(255,59,59,0.3); border-radius:8px; padding:12px 18px; display:none; align-items:center; gap:10px; margin-bottom:20px; font-size:13px; }
+.alert-dot { width:6px; height:6px; border-radius:50%; background:var(--danger); flex-shrink:0; animation:dotpulse 1.2s infinite; }
+@keyframes dotpulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:0.5;transform:scale(1.5);}}
+
+/* PANEL */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.panel-header { padding: 18px 22px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.panel-title { font-family: var(--mono); font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--text-muted); }
+.panel-badge { background: var(--surface3); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; font-size: 11px; font-family: var(--mono); color: var(--text-muted); }
+.table-wrap { overflow-x: auto; }
+
+/* TABLE */
+table { width: 100%; border-collapse: collapse; min-width: 660px; }
+thead th { padding: 11px 12px; background: var(--surface2); font-family: var(--mono); font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--text-muted); font-weight: 400; border-bottom: 1px solid var(--border); text-align: center; white-space: nowrap; }
+thead th:first-child, thead th:nth-child(2), thead th:nth-child(3) { text-align: left; }
+tbody td { padding: 12px 12px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 13px; transition: background 0.15s; }
+tbody td:first-child, tbody td:nth-child(2), tbody td:nth-child(3) { text-align: left; }
+tbody tr:hover td { background: var(--surface2); }
+tbody tr:last-child td { border-bottom: none; }
+.cell-item { font-weight: 600; }
+.color-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
+.type-badge { padding: 3px 8px; border-radius: 4px; font-size: 10px; font-family: var(--mono); letter-spacing: 1px; text-transform: uppercase; }
+.type-badge.oversize { background: rgba(232,255,71,0.12); color: var(--accent); }
+.type-badge.regular { background: rgba(255,255,255,0.07); color: var(--text-dim); }
+.qty { font-family: var(--mono); font-size: 13px; font-weight: 700; }
+.qty.zero { color: #444; }
+.qty.low { color: var(--danger); animation: qpulse 1.5s infinite; }
+.qty.high { color: var(--success); }
+.qty.dash { color: #2a2a2a; font-size: 12px; }
+@keyframes qpulse{0%,100%{text-shadow:0 0 0 rgba(255,59,59,0);}50%{text-shadow:0 0 8px rgba(255,59,59,0.7);}}
+.empty-state { padding: 60px; text-align: center; color: var(--text-muted); font-family: var(--mono); font-size: 12px; letter-spacing: 2px; }
+.row-del { background: none; border: none; color: #2a2a2a; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 4px; transition: all 0.2s; }
+.row-del:hover { color: var(--danger); background: rgba(255,59,59,0.1); }
+
+/* CHART */
+.chart-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-top: 24px; }
+.chart-panel-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+.chart-title { font-family: var(--mono); font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--text-muted); }
+.chart-wrap { height: 200px; position: relative; }
+
+/* POPUP */
+.popup-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(6px); justify-content: center; align-items: center; z-index: 2000; }
+.popup-overlay.active { display: flex; }
+.popup-box { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; width: 92%; max-width: 400px; animation: slideUp 0.25s cubic-bezier(0.16,1,0.3,1); position: relative; max-height: 90vh; overflow-y: auto; }
+@keyframes slideUp { from{transform:translateY(20px) scale(0.97);opacity:0;} to{transform:translateY(0) scale(1);opacity:1;} }
+.popup-box h2 { font-family: var(--mono); font-size: 13px; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 22px; }
+.popup-close { position: absolute; top: 20px; right: 20px; background: var(--surface2); border: 1px solid var(--border); color: var(--text-muted); width: 28px; height: 28px; border-radius: 6px; cursor: pointer; font-size: 13px; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+.popup-close:hover { color: var(--text); border-color: var(--text-dim); }
+.form-group { margin-bottom: 16px; }
+.form-label { display: block; font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; font-family: var(--mono); }
+.form-input { width: 100%; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: var(--sans); font-size: 14px; transition: border 0.2s; }
+.form-input:focus { outline: none; border-color: var(--accent); }
+.form-select { width: 100%; padding: 10px 32px 10px 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: var(--sans); font-size: 14px; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23666' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; transition: border 0.2s; }
+.form-select:focus { outline: none; border-color: var(--accent); }
+.form-select option { background: #1a1a1a; }
+
+/* PILL GROUP */
+.pill-group { display: flex; flex-wrap: wrap; gap: 7px; }
+.pill {
+  padding: 7px 13px; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-size: 11px; font-family: var(--mono); letter-spacing: 1px;
+  cursor: pointer; transition: all 0.15s; user-select: none;
+  display: flex; align-items: center; gap: 6px;
+}
+.pill:hover { border-color: var(--text-muted); }
+.pill input[type=checkbox] { display: none; }
+.pill.on { border-color: var(--accent); background: rgba(232,255,71,0.1); color: var(--accent); }
+.pill-check { width: 12px; height: 12px; border: 1px solid currentColor; border-radius: 2px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 9px; }
+
+.popup-actions { display: flex; gap: 10px; margin-top: 22px; }
+.popup-actions .btn { flex: 1; padding: 12px; font-size: 11px; }
+
+/* TOAST */
+.toast-wrap { position: fixed; bottom: 24px; right: 24px; z-index: 9998; display: flex; flex-direction: column; gap: 8px; }
+.toast { padding: 12px 18px; border-radius: 8px; font-family: var(--mono); font-size: 12px; letter-spacing: 1px; border-left: 3px solid; animation: toastIn 0.3s cubic-bezier(0.16,1,0.3,1); max-width: 280px; }
+.toast.success { background: var(--surface2); border-color: var(--success); color: var(--success); }
+.toast.error   { background: var(--surface2); border-color: var(--danger);  color: var(--danger); }
+.toast.info    { background: var(--surface2); border-color: var(--accent);  color: var(--accent); }
+@keyframes toastIn { from{transform:translateX(20px);opacity:0;} to{transform:translateX(0);opacity:1;} }
+
+/* RESPONSIVE */
+@media(max-width:768px){ .main{padding:0 16px 40px;} .stats-grid{grid-template-columns:repeat(2,1fr);} .header-actions{gap:8px;} }
+@media(max-width:480px){ .main{padding:0 12px 40px;} .brand h1{font-size:22px;} .btn{padding:10px 14px;font-size:11px;} }
+</style>
+</head>
+<body>
+
+<div class="hamburger" id="hamburger"><span></span><span></span><span></span></div>
+<div class="side-overlay" id="sideOverlay"></div>
+<div class="side-menu" id="sideMenu">
+  <h2>// Settings</h2>
+  <button class="side-btn side-btn-warn" id="openDeleteStockBtn">− Delete Stock</button>
+  <button class="side-btn side-btn-danger" id="clearDataBtn">⚠ Clear All Data</button>
+</div>
+
+<div class="main">
+  <header>
+    <div class="brand">
+      <h1>NEX<span>IS</span></h1>
+      <p>Stock Management System</p>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-secondary" id="openSoldBtn">− Sold</button>
+      <button class="btn btn-secondary" id="openAddStockBtn">+ Add Stock</button>
+      <button class="btn btn-primary" id="openNewItemBtn">+ New Item</button>
+    </div>
+  </header>
+
+  <div class="alert-bar" id="alertBar">
+    <span class="alert-dot"></span>
+    <span id="alertText"></span>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Total Sold</div>
+      <div class="stat-value" id="statTotal" style="color:var(--accent)">0</div>
+      <div class="stat-sub">all time units</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Oversize Sold</div>
+      <div class="stat-value" id="statOversize">0</div>
+      <div class="stat-sub">units</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Regular Sold</div>
+      <div class="stat-value" id="statRegular">0</div>
+      <div class="stat-sub">units</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">In Stock</div>
+      <div class="stat-value" id="statStock">0</div>
+      <div class="stat-sub">units remaining</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Low Stock</div>
+      <div class="stat-value" id="statLow" style="color:var(--danger)">0</div>
+      <div class="stat-sub">rows ≤ 2 units</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Rows</div>
+      <div class="stat-value" id="statRows">0</div>
+      <div class="stat-sub">entries</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">// Inventory</span>
+      <span class="panel-badge" id="rowBadge">0 rows</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Item</th><th>Color</th><th>Type</th>
+            <th>S</th><th>M</th><th>L</th><th>XL</th><th>XXL</th><th>XXXL</th><th>4XL</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="chart-panel">
+    <div class="chart-panel-hdr">
+      <span class="chart-title">// Sales Timeline</span>
+      <button class="btn btn-secondary" id="clearChartBtn" style="padding:6px 14px;font-size:10px;">Clear</button>
+    </div>
+    <div class="chart-wrap"><canvas id="salesChart"></canvas></div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<!-- ══ NEW ITEM POPUP ══ -->
+<div class="popup-overlay" id="newItemPopup">
+  <div class="popup-box">
+    <button class="popup-close" onclick="closePopup('newItemPopup')">✕</button>
+    <h2>New Item</h2>
+    <div class="form-group">
+      <label class="form-label">Item Name</label>
+      <input class="form-input" type="text" id="ni_name" placeholder="e.g. Hoodie, T-Shirt...">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Color</label>
+      <div class="pill-group" id="ni_colors">
+        <label class="pill"><input type="checkbox" value="black"><span class="pill-check"></span>Black</label>
+        <label class="pill"><input type="checkbox" value="white"><span class="pill-check"></span>White</label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Type</label>
+      <div class="pill-group" id="ni_types">
+        <label class="pill"><input type="checkbox" value="oversize"><span class="pill-check"></span>Oversize</label>
+        <label class="pill"><input type="checkbox" value="regular"><span class="pill-check"></span>Regular</label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Available Sizes</label>
+      <div class="pill-group" id="ni_sizes">
+        <label class="pill"><input type="checkbox" value="s"><span class="pill-check"></span>S</label>
+        <label class="pill"><input type="checkbox" value="m"><span class="pill-check"></span>M</label>
+        <label class="pill"><input type="checkbox" value="l"><span class="pill-check"></span>L</label>
+        <label class="pill"><input type="checkbox" value="xl"><span class="pill-check"></span>XL</label>
+        <label class="pill"><input type="checkbox" value="xxl"><span class="pill-check"></span>XXL</label>
+        <label class="pill"><input type="checkbox" value="xxxl"><span class="pill-check"></span>XXXL</label>
+        <label class="pill"><input type="checkbox" value="4xl"><span class="pill-check"></span>4XL</label>
+      </div>
+    </div>
+    <div class="popup-actions">
+      <button class="btn btn-primary" id="submitNewItemBtn">Add Row</button>
+      <button class="btn btn-secondary" onclick="closePopup('newItemPopup')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ ADD STOCK POPUP ══ -->
+<div class="popup-overlay" id="addStockPopup">
+  <div class="popup-box">
+    <button class="popup-close" onclick="closePopup('addStockPopup')">✕</button>
+    <h2>Add Stock</h2>
+    <div class="form-group">
+      <label class="form-label">Select Row</label>
+      <select class="form-select" id="as_row" onchange="syncSizeSelect('as_row','as_size')"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Size</label>
+      <select class="form-select" id="as_size"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Quantity</label>
+      <input class="form-input" type="number" id="as_qty" value="1" min="1">
+    </div>
+    <div class="popup-actions">
+      <button class="btn btn-primary" id="confirmAddStockBtn">Add Stock</button>
+      <button class="btn btn-secondary" onclick="closePopup('addStockPopup')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ DELETE STOCK POPUP ══ -->
+<div class="popup-overlay" id="deleteStockPopup">
+  <div class="popup-box">
+    <button class="popup-close" onclick="closePopup('deleteStockPopup')">✕</button>
+    <h2>Delete Stock</h2>
+    <p style="font-size:12px;color:var(--text-muted);margin-bottom:18px;font-family:var(--mono);line-height:1.6;">Removes units from stock <span style="color:#f0a500;">without</span> counting as a sale. Use this for damaged, lost, or returned items.</p>
+    <div class="form-group">
+      <label class="form-label">Select Row</label>
+      <select class="form-select" id="ds_row" onchange="syncSizeSelect('ds_row','ds_size')"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Size</label>
+      <select class="form-select" id="ds_size"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Quantity to Remove</label>
+      <input class="form-input" type="number" id="ds_qty" value="1" min="1">
+    </div>
+    <div class="popup-actions">
+      <button class="btn" id="confirmDeleteStockBtn" style="flex:1;padding:12px;font-size:11px;background:var(--surface3);color:#f0a500;border:1px solid #f0a500;">Remove Stock</button>
+      <button class="btn btn-secondary" onclick="closePopup('deleteStockPopup')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+
+<div class="popup-overlay" id="soldPopup">
+  <div class="popup-box">
+    <button class="popup-close" onclick="closePopup('soldPopup')">✕</button>
+    <h2>Record Sale</h2>
+    <div class="form-group">
+      <label class="form-label">Select Row</label>
+      <select class="form-select" id="sold_row" onchange="syncSizeSelect('sold_row','sold_size')"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Size</label>
+      <select class="form-select" id="sold_size"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Quantity</label>
+      <input class="form-input" type="number" id="sold_qty" value="1" min="1">
+    </div>
+    <div class="popup-actions">
+      <button class="btn btn-primary" id="confirmSoldBtn">Confirm Sale</button>
+      <button class="btn btn-secondary" onclick="closePopup('soldPopup')">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ════════════════════════════
+// STATE  (populated by onValue listeners set up in the module above)
+// ════════════════════════════
+const ALL_SIZES = ["s","m","l","xl","xxl","xxxl","4xl"];
+
+// Initialise with safe defaults; the onValue listeners will hydrate these
+// as soon as Firebase responds (usually <500 ms).
+window.rows     = window.rows     || [];
+window.salesLog = window.salesLog || [];
+window.st       = window.st       || { total: 0, oversize: 0, regular: 0 };
+
+// Convenience aliases so the rest of the script reads naturally
+Object.defineProperty(window, 'rows',     { configurable: true, enumerable: true, get(){ return window._rows     || []; }, set(v){ window._rows     = v; } });
+Object.defineProperty(window, 'salesLog', { configurable: true, enumerable: true, get(){ return window._salesLog || []; }, set(v){ window._salesLog = v; } });
+Object.defineProperty(window, 'st',       { configurable: true, enumerable: true, get(){ return window._st       || {total:0,oversize:0,regular:0}; }, set(v){ window._st       = v; } });
+
+function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,5); }
+
+// ════════════════════════════
+// HAMBURGER
+// ════════════════════════════
+const hb = document.getElementById("hamburger");
+const sm = document.getElementById("sideMenu");
+const so = document.getElementById("sideOverlay");
+hb.onclick = () => { hb.classList.toggle("active"); sm.classList.toggle("open"); so.classList.toggle("show"); };
+so.onclick = () => { hb.classList.remove("active"); sm.classList.remove("open"); so.classList.remove("show"); };
+
+// ════════════════════════════
+// POPUPS
+// ════════════════════════════
+function openPopup(id){ document.getElementById(id).classList.add("active"); }
+function closePopup(id){ document.getElementById(id).classList.remove("active"); }
+document.querySelectorAll(".popup-overlay").forEach(el => {
+  el.addEventListener("click", e => { if(e.target===el) el.classList.remove("active"); });
+});
+
+// ════════════════════════════
+// PILL CHECKBOXES
+// ════════════════════════════
+document.querySelectorAll(".pill").forEach(pill => {
+  pill.addEventListener("click", () => {
+    const cb  = pill.querySelector("input[type=checkbox]");
+    const chk = pill.querySelector(".pill-check");
+    requestAnimationFrame(() => {
+      if(cb.checked){ pill.classList.add("on"); chk.textContent = "✓"; }
+      else           { pill.classList.remove("on"); chk.textContent = ""; }
+    });
+  });
+});
+
+function getChecked(groupId){
+  return [...document.querySelectorAll(`#${groupId} input[type=checkbox]:checked`)].map(cb=>cb.value);
+}
+function resetGroup(groupId){
+  document.querySelectorAll(`#${groupId} .pill`).forEach(p => {
+    p.querySelector("input").checked = false;
+    p.classList.remove("on");
+    p.querySelector(".pill-check").textContent = "";
+  });
+}
+
+// ════════════════════════════
+// NEW ITEM
+// ════════════════════════════
+document.getElementById("openNewItemBtn").onclick = () => {
+  document.getElementById("ni_name").value = "";
+  resetGroup("ni_colors"); resetGroup("ni_types"); resetGroup("ni_sizes");
+  openPopup("newItemPopup");
+};
+
+document.getElementById("submitNewItemBtn").onclick = () => {
+  const name   = document.getElementById("ni_name").value.trim();
+  const colors = getChecked("ni_colors");
+  const types  = getChecked("ni_types");
+  const sizes  = getChecked("ni_sizes");
+
+  if(!name)          { toast("Enter an item name","error"); return; }
+  if(!colors.length) { toast("Select at least one color","error"); return; }
+  if(!types.length)  { toast("Select at least one type","error"); return; }
+  if(!sizes.length)  { toast("Select at least one size","error"); return; }
+
+  let added = 0;
+  colors.forEach(color => {
+    types.forEach(type => {
+      const sizeObj = {};
+      sizes.forEach(s => sizeObj[s] = 0);
+      const newRow = { id: uid(), name, color, type, sizes: sizeObj, firebaseKey: null };
+      // addItemToFirebase assigns firebaseKey and persists the record.
+      // The onValue listener will add it to window.rows and trigger renderTable().
+      if(typeof window.addItemToFirebase === "function"){
+        window.addItemToFirebase(newRow);
+      }
+      added++;
+    });
+  });
+
+  closePopup("newItemPopup");
+  toast(`Added ${added} row${added>1?"s":""} for "${name}"`, "success");
+};
+
+// ════════════════════════════
+// ADD STOCK
+// ════════════════════════════
+document.getElementById("openAddStockBtn").onclick = () => {
+  if(!window.rows.length){ toast("Add an item first","error"); return; }
+  fillRowSelect("as_row"); syncSizeSelect("as_row","as_size");
+  document.getElementById("as_qty").value = 1;
+  openPopup("addStockPopup");
+};
+
+document.getElementById("confirmAddStockBtn").onclick = () => {
+  const rowId = document.getElementById("as_row").value;
+  const size  = document.getElementById("as_size").value;
+  const qty   = parseInt(document.getElementById("as_qty").value);
+  if(!rowId||!size||isNaN(qty)||qty<1){ toast("Fill all fields","error"); return; }
+
+  const row = window.rows.find(r=>r.id===rowId);
+  if(!row){ toast("Row not found","error"); return; }
+
+  // Mutate local copy optimistically then sync
+  row.sizes[size] = (row.sizes[size]||0) + qty;
+
+  if(typeof window.updateItemInFirebase === "function"){
+    window.updateItemInFirebase(row.firebaseKey, row.sizes);
+    // onValue will re-render the table once Firebase confirms the write
+  }
+
+  closePopup("addStockPopup");
+  toast(`+${qty} ${row.name} ${size.toUpperCase()}`, "success");
+};
+
+// ════════════════════════════
+// SOLD
+// ════════════════════════════
+document.getElementById("openSoldBtn").onclick = () => {
+  if(!window.rows.length){ toast("No items to sell","error"); return; }
+  fillRowSelect("sold_row"); syncSizeSelect("sold_row","sold_size");
+  document.getElementById("sold_qty").value = 1;
+  openPopup("soldPopup");
+};
+
+document.getElementById("confirmSoldBtn").onclick = () => {
+  const rowId = document.getElementById("sold_row").value;
+  const size  = document.getElementById("sold_size").value;
+  const qty   = parseInt(document.getElementById("sold_qty").value);
+  if(!rowId||!size||isNaN(qty)||qty<1){ toast("Fill all fields","error"); return; }
+
+  const row = window.rows.find(r=>r.id===rowId);
+  if(!row){ toast("Row not found","error"); return; }
+
+  const cur = row.sizes[size]||0;
+  if(cur<qty){ toast(`Only ${cur} in stock for size ${size.toUpperCase()}`, "error"); return; }
+
+  // Update sizes
+  row.sizes[size] -= qty;
+  if(typeof window.updateItemInFirebase === "function"){
+    window.updateItemInFirebase(row.firebaseKey, row.sizes);
+  }
+
+  // Push sale record — never overwrites, always appends
+  const saleRecord = { qty, rowId, size, type: row.type, time: Date.now() };
+  if(typeof window.pushSaleToFirebase === "function"){
+    window.pushSaleToFirebase(saleRecord);
+  }
+
+  // Atomically increment summary counters
+  if(typeof window.incrementSummary === "function"){
+    window.incrementSummary(
+      qty,
+      row.type === "oversize" ? qty : 0,
+      row.type !== "oversize" ? qty : 0
+    );
+  }
+
+  closePopup("soldPopup");
+  toast(`Sold ${qty}× ${row.name} ${size.toUpperCase()}`, "info");
+};
+
+// ════════════════════════════
+// HELPERS — row/size selects
+// ════════════════════════════
+function fillRowSelect(selId){
+  const sel = document.getElementById(selId);
+  sel.innerHTML = "";
+  window.rows.forEach(r => {
+    const opt = document.createElement("option");
+    opt.value = r.id;
+    opt.text  = `${r.name} / ${r.color} / ${r.type}`;
+    sel.appendChild(opt);
+  });
+}
+function syncSizeSelect(rowSelId, sizeSelId){
+  const rowId = document.getElementById(rowSelId).value;
+  const row   = window.rows.find(r=>r.id===rowId);
+  const sel   = document.getElementById(sizeSelId);
+  sel.innerHTML = "";
+  if(!row) return;
+  Object.keys(row.sizes).forEach(s => {
+    const opt = document.createElement("option");
+    opt.value = s; opt.text = s.toUpperCase();
+    sel.appendChild(opt);
+  });
+}
+
+// ════════════════════════════
+// DELETE ROW
+// ════════════════════════════
+function deleteRow(id){
+  const row = window.rows.find(r=>r.id===id);
+  if(!row) return;
+  if(!confirm(`Delete "${row.name} / ${row.color} / ${row.type}"?`)) return;
+
+  if(typeof window.deleteItemFromFirebase === "function"){
+    window.deleteItemFromFirebase(row.firebaseKey);
+    // onValue listener will remove it from window.rows and re-render
+  }
+  toast("Row deleted","info");
+}
+
+// ════════════════════════════
+// RENDER TABLE
+// ════════════════════════════
+function renderTable(){
+  const tbody = document.getElementById("tableBody");
+  tbody.innerHTML = "";
+  const currentRows = window.rows;
+
+  if(!currentRows.length){
+    tbody.innerHTML = `<tr><td colspan="11" class="empty-state">No items yet — click "+ New Item" to add one</td></tr>`;
+    updateStats(0, 0, 0); return;
+  }
+
+  let totalStock = 0, lowRows = 0;
+
+  currentRows.forEach(row => {
+    const tr = document.createElement("tr");
+    let rowHasLow = false;
+
+    const tdN = document.createElement("td");
+    tdN.innerHTML = `<span class="cell-item">${row.name}</span>`;
+    tr.appendChild(tdN);
+
+    const tdC = document.createElement("td");
+    const dotStyle = row.color==="black" ? "background:#555;border:1px solid #666"
+                   : row.color==="white" ? "background:#ddd"
+                   : `background:${row.color}`;
+    tdC.innerHTML = `<span class="color-dot" style="${dotStyle}"></span>${row.color}`;
+    tr.appendChild(tdC);
+
+    const tdT = document.createElement("td");
+    tdT.innerHTML = `<span class="type-badge ${row.type}">${row.type}</span>`;
+    tr.appendChild(tdT);
+
+    ALL_SIZES.forEach(s => {
+      const td = document.createElement("td");
+      if(!(s in row.sizes)){
+        td.innerHTML = `<span class="qty dash">—</span>`;
+      } else {
+        const q = row.sizes[s];
+        totalStock += q;
+        let cls = "qty";
+        if(q===0) cls+=" zero";
+        else if(q<=2){ cls+=" low"; rowHasLow=true; }
+        else if(q>=10) cls+=" high";
+        td.innerHTML = `<span class="${cls}">${q}</span>`;
+      }
+      tr.appendChild(td);
+    });
+
+    if(rowHasLow) lowRows++;
+
+    const tdDel = document.createElement("td");
+    tdDel.innerHTML = `<button class="row-del" onclick="deleteRow('${row.id}')">✕</button>`;
+    tr.appendChild(tdDel);
+
+    tbody.appendChild(tr);
+  });
+
+  updateStats(totalStock, lowRows, currentRows.length);
+}
+
+function updateStats(totalStock, lowRows, rowCount){
+  const s = window.st;
+  document.getElementById("statTotal").textContent    = s.total    || 0;
+  document.getElementById("statOversize").textContent = s.oversize || 0;
+  document.getElementById("statRegular").textContent  = s.regular  || 0;
+  document.getElementById("statStock").textContent    = totalStock;
+  document.getElementById("statLow").textContent      = lowRows;
+  document.getElementById("statRows").textContent     = rowCount;
+  document.getElementById("rowBadge").textContent     = `${rowCount} rows`;
+
+  const bar = document.getElementById("alertBar");
+  if(lowRows > 0){
+    bar.style.display = "flex";
+    document.getElementById("alertText").textContent = `${lowRows} row(s) have low stock (≤2 units) — restock needed`;
+  } else {
+    bar.style.display = "none";
+  }
+}
+
+// ════════════════════════════
+// CHART
+// ════════════════════════════
+const ctx = document.getElementById("salesChart").getContext("2d");
+const chart = new Chart(ctx, {
+  type: "line",
+  data: { labels: [], datasets: [{ label: "Sold", data: [],
+    borderColor: "#e8ff47", backgroundColor: "rgba(232,255,71,0.07)",
+    pointBackgroundColor: "#e8ff47", pointRadius: 4, pointHoverRadius: 6,
+    borderWidth: 2, tension: 0.4, fill: true }]},
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { display: false },
+      tooltip: { backgroundColor: "#1a1a1a", borderColor: "#2a2a2a", borderWidth: 1,
+        titleColor: "#999", bodyColor: "#e8ff47",
+        titleFont: { family: "Space Mono", size: 10 }, bodyFont: { family: "Space Mono", size: 12 }}},
+    scales: {
+      y: { beginAtZero: true, ticks: { color: "#555", font: { family: "Space Mono", size: 10 }, stepSize: 1 }, grid: { color: "rgba(255,255,255,0.04)" }, border: { color: "transparent" }},
+      x: { ticks: { color: "#555", font: { family: "Space Mono", size: 10 }}, grid: { display: false }, border: { color: "transparent" }}
+    }
+  }
+});
+
+function updateChart(){
+  const last = (window.salesLog || []).slice(-30);
+  chart.data.labels = last.map((_,i) => `#${i+1}`);
+  chart.data.datasets[0].data = last.map(s => s.qty);
+  chart.update();
+}
+
+// Clear sales chart — removes only the sales log, not items or summary
+document.getElementById("clearChartBtn").onclick = () => {
+  if(!confirm("Clear the sales timeline? Item stock and totals won't change.")) return;
+  if(typeof window.clearSalesFirebase === "function"){
+    window.clearSalesFirebase();
+    // onValue for sales will fire and call updateChart()
+  }
+  toast("Sales timeline cleared","info");
+};
+
+// ════════════════════════════
+// DELETE STOCK (no sale recorded)
+// ════════════════════════════
+document.getElementById("openDeleteStockBtn").onclick = () => {
+  if(!window.rows.length){ toast("No items in inventory","error"); return; }
+  fillRowSelect("ds_row"); syncSizeSelect("ds_row","ds_size");
+  document.getElementById("ds_qty").value = 1;
+  hb.classList.remove("active"); sm.classList.remove("open"); so.classList.remove("show");
+  openPopup("deleteStockPopup");
+};
+
+document.getElementById("confirmDeleteStockBtn").onclick = () => {
+  const rowId = document.getElementById("ds_row").value;
+  const size  = document.getElementById("ds_size").value;
+  const qty   = parseInt(document.getElementById("ds_qty").value);
+  if(!rowId||!size||isNaN(qty)||qty<1){ toast("Fill all fields","error"); return; }
+
+  const row = window.rows.find(r=>r.id===rowId);
+  if(!row){ toast("Row not found","error"); return; }
+
+  const cur = row.sizes[size]||0;
+  if(cur<qty){ toast(`Only ${cur} in stock for size ${size.toUpperCase()}`, "error"); return; }
+
+  // Decrease stock only — no sale record, no counter increment
+  row.sizes[size] -= qty;
+  if(typeof window.updateItemInFirebase === "function"){
+    window.updateItemInFirebase(row.firebaseKey, row.sizes);
+  }
+
+  closePopup("deleteStockPopup");
+  toast(`Removed ${qty}× ${row.name} ${size.toUpperCase()} (no sale recorded)`, "info");
+};
+
+
+document.getElementById("clearDataBtn").onclick = () => {
+  if(!confirm("Clear ALL data? This cannot be undone.")) return;
+  if(typeof window.clearAllFirebaseData === "function"){
+    window.clearAllFirebaseData();
+    // All three onValue listeners will fire and reset the UI
+  }
+  toast("All data cleared","info");
+  hb.classList.remove("active"); sm.classList.remove("open"); so.classList.remove("show");
+};
+
+// ════════════════════════════
+// TOAST
+// ════════════════════════════
+function toast(msg, type="success"){
+  const wrap = document.getElementById("toastWrap");
+  const t = document.createElement("div");
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  wrap.appendChild(t);
+  setTimeout(()=>{ t.style.transition="opacity 0.4s"; t.style.opacity="0"; }, 2400);
+  setTimeout(()=>t.remove(), 2900);
+}
+
+// Initial render (Firebase listeners will update it once data arrives)
+renderTable();
+updateChart();
+</script>
+</body>
+</html>
